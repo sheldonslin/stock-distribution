@@ -3,12 +3,9 @@ name: 更新股票涨跌分布
 on:
   schedule:
     # 交易日 9:30-15:00 每20分钟（UTC = 北京-8）
-    # 北京 9:20 = UTC 1:20, 北京 15:20 = UTC 7:20
-    # 周一到周五 UTC 1:00-7:59 每20分钟
     - cron: '*/20 1-7 * * 1-5'
-  workflow_dispatch:  # 支持手动触发
+  workflow_dispatch:
 
-# 给 GITHUB_TOKEN 写入权限，用于部署 GitHub Pages
 permissions:
   contents: write
   pages: write
@@ -16,7 +13,7 @@ permissions:
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -25,15 +22,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: 缓存 pip 依赖
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-
-      - name: 安装依赖
-        run: pip install -r requirements.txt
 
       - name: 抓取数据生成 JSON
         run: python scripts/fetch_stock.py
@@ -45,15 +33,9 @@ jobs:
           publish_dir: ./dist
           force_orphan: true
 
-  # 防止 GitHub 因仓库不活跃而自动禁用 scheduled workflows
-  # GitHub 策略：60天无push/PR活动会暂停cron调度，且不通知
   keepalive:
     runs-on: ubuntu-latest
-    # 只在 schedule 触发时运行，手动触发不需要
     if: github.event_name == 'schedule'
     steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
-
-      - name: Keep workflow alive
-        uses: gautamkrishnar/keepalive-workflow@v2
+      - uses: actions/checkout@v4
+      - uses: gautamkrishnar/keepalive-workflow@v2

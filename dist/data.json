@@ -1,2 +1,21 @@
-# 占位文件，首次部署用
-{"status": "pending", "message": "数据尚未更新，请等待 GitHub Actions 首次运行"}
+{
+  "status": "success",
+  "data": {
+    "distribution": {
+      "涨停": 88,
+      "涨5-10%": 187,
+      "涨0-5%": 3504,
+      "平盘": 436,
+      "跌0-5%": 1250,
+      "跌5-10%": 34,
+      "跌停": 7
+    },
+    "summary": {
+      "up_count": 3779,
+      "down_count": 1291,
+      "flat_count": 436,
+      "total_count": 5506
+    }
+  },
+  "last_updated": "2026-02-25 12:52:50"
+}

@@ -1,171 +1,171 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-===========================================
-股票涨跌分布数据抓取脚本
-===========================================
-用途：通过 akshare 抓取A股实时涨跌分布，生成 JSON 文件
-参数：无
-输出：dist/data.json
-说明：
-  - 由 GitHub Actions 定时调用
-  - 交易日 9:30-15:00 每20分钟跑一次
-  - 非交易时间由 Actions 的 cron 控制，脚本本身不做时间判断
-  - 内置重试机制（5次）+ 浏览器请求头伪装，绕过东财反爬
-  - 时间戳使用北京时间（UTC+8）
-===========================================
+股票涨跌分布 — 腾讯财经接口版
+零依赖，纯标准库，GitHub Actions 海外IP可用
+数据源：qt.gtimg.cn（腾讯不封海外IP）
 """
 
-import akshare as ak
-import requests
-import pandas as pd
 import json
 import os
 import sys
-import time
-import random
+import urllib.request
+import concurrent.futures
 from datetime import datetime, timezone, timedelta
 
-# ============================================
-# 配置区
-# ============================================
 OUTPUT_DIR = "dist"
 OUTPUT_FILE = os.path.join(OUTPUT_DIR, "data.json")
-MAX_RETRIES = 5
-RETRY_DELAY = 15  # 秒
-
-# 北京时间
 BJ_TZ = timezone(timedelta(hours=8))
+BATCH_SIZE = 80
+CONCURRENCY = 10
+TIMEOUT = 15
 
-# 浏览器 User-Agent 池，随机选一个伪装请求
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:134.0) Gecko/20100101 Firefox/134.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Safari/605.1.15",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
-]
-
-# 涨跌幅区间定义
-RANGES = {
-    '涨停': (9.8, float('inf')),
-    '上涨5-10%': (5, 9.8),
-    '上涨0-5%': (0.01, 5),
-    '平盘': (0, 0),
-    '下跌0-5%': (-5, -0.01),
-    '下跌5-10%': (-9.8, -5),
-    '跌停': (float('-inf'), -9.8)
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 }
+
+# A股全部代码（沪深主板+创业板+科创板+北交所）
+STOCK_CODES_FILE = os.path.join(os.path.dirname(__file__), "stock_codes.json")
 
 
 def now_bj():
-    """返回北京时间"""
     return datetime.now(BJ_TZ)
 
 
-def patch_requests_headers():
-    """给 requests 全局 Session 打补丁，伪装浏览器请求头，绕过东财反爬"""
-    ua = random.choice(USER_AGENTS)
-    headers = {
-        "User-Agent": ua,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Referer": "https://quote.eastmoney.com/center/gridlist.html",
-    }
-    # 猴子补丁：替换 requests.Session 的默认 headers
-    original_init = requests.Session.__init__
-
-    def patched_init(self, *args, **kwargs):
-        original_init(self, *args, **kwargs)
-        self.headers.update(headers)
-
-    requests.Session.__init__ = patched_init
-
-    # 也给 requests.get/post 的默认 headers 打补丁
-    if hasattr(requests, 'utils'):
-        requests.utils.default_headers = lambda: requests.structures.CaseInsensitiveDict(headers)
-
-    print(f"[{now_bj().strftime('%Y-%m-%d %H:%M:%S')}] 已伪装浏览器请求头: {ua[:50]}...")
+def log(msg):
+    print(f"[{now_bj().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
 
 
-def fetch_with_retry():
-    """带重试的数据抓取，每次重试前重新伪装请求头"""
-    for attempt in range(1, MAX_RETRIES + 1):
+def generate_stock_codes():
+    """生成全部A股代码列表"""
+    codes = []
+    # 沪市主板 600000-605999
+    for i in range(600000, 606000):
+        codes.append(f"sh{i}")
+    # 沪市科创板 688000-689999
+    for i in range(688000, 690000):
+        codes.append(f"sh{i}")
+    # 深市主板 000001-003999
+    for i in range(1, 4000):
+        codes.append(f"sz{i:06d}")
+    # 深市中小板（已合并到主板）002001-002999
+    # 已包含在上面
+    # 深市创业板 300001-301999
+    for i in range(300001, 302000):
+        codes.append(f"sz{i}")
+    # 北交所 8xxxxx -> bj
+    for i in range(430001, 430999):
+        codes.append(f"bj{i}")
+    for i in range(830001, 840000):
+        codes.append(f"bj{i}")
+    for i in range(870001, 880000):
+        codes.append(f"bj{i}")
+    return codes
+
+
+def load_stock_codes():
+    """优先从文件加载，没有就自动生成"""
+    if os.path.exists(STOCK_CODES_FILE):
+        with open(STOCK_CODES_FILE, "r") as f:
+            codes = json.load(f)
+        log(f"从文件加载 {len(codes)} 个代码")
+        return codes
+    codes = generate_stock_codes()
+    log(f"自动生成 {len(codes)} 个代码")
+    return codes
+
+
+def fetch_batch(batch):
+    """请求一批股票数据"""
+    url = f"https://qt.gtimg.cn/q={','.join(batch)}"
+    req = urllib.request.Request(url, headers=HEADERS)
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            raw = resp.read().decode("gbk", errors="ignore")
+    except Exception:
+        return []
+
+    results = []
+    for line in raw.split(";"):
+        line = line.strip()
+        if not line or "~" not in line:
+            continue
+        parts = line.split("~")
+        if len(parts) < 40:
+            continue
         try:
-            if attempt > 1:
-                jitter = random.uniform(3, 8)
-                print(f"  随机等待{jitter:.1f}秒...")
-                time.sleep(jitter)
-            patch_requests_headers()
-            print(f"[{now_bj().strftime('%Y-%m-%d %H:%M:%S')}] 第{attempt}次尝试获取数据...")
-            df = ak.stock_zh_a_spot_em()
-            print(f"[{now_bj().strftime('%Y-%m-%d %H:%M:%S')}] 数据获取成功，共{len(df)}条")
-            return df
-        except Exception as e:
-            print(f"[{now_bj().strftime('%Y-%m-%d %H:%M:%S')}] 第{attempt}次失败: {e}")
-            if attempt < MAX_RETRIES:
-                delay = RETRY_DELAY * attempt
-                print(f"  等待{delay}秒后重试...")
-                time.sleep(delay)
-            else:
-                raise
+            pct = float(parts[32])
+        except (ValueError, IndexError):
+            continue
+        results.append({"code": parts[2], "name": parts[1], "pct": pct})
+    return results
 
 
-def fetch_market_distribution():
-    """抓取A股涨跌分布数据"""
-    print(f"[{now_bj().strftime('%Y-%m-%d %H:%M:%S')}] 开始获取市场涨跌分布数据...")
+def fetch_all_stocks():
+    """并发获取全部股票数据"""
+    codes = load_stock_codes()
+    batches = [codes[i:i + BATCH_SIZE] for i in range(0, len(codes), BATCH_SIZE)]
+    log(f"共 {len(codes)} 个代码，分 {len(batches)} 批，并发 {CONCURRENCY}")
 
-    df = fetch_with_retry()
-    df['涨跌幅'] = pd.to_numeric(df['涨跌幅'], errors='coerce')
-    df = df.dropna(subset=['涨跌幅'])
+    all_stocks = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
+        futures = {pool.submit(fetch_batch, b): i for i, b in enumerate(batches)}
+        for future in concurrent.futures.as_completed(futures):
+            all_stocks.extend(future.result())
 
-    distribution = {}
-    for name, (lower, upper) in RANGES.items():
-        if lower == upper:
-            count = int(df[df['涨跌幅'] == lower].shape[0])
+    log(f"获取到 {len(all_stocks)} 只有效数据")
+    return all_stocks
+
+
+def calc_distribution(stocks):
+    dist = {"涨停": 0, "涨5-10%": 0, "涨0-5%": 0, "平盘": 0, "跌0-5%": 0, "跌5-10%": 0, "跌停": 0}
+    up = down = flat = 0
+    for s in stocks:
+        p = s["pct"]
+        if p > 9.8:
+            dist["涨停"] += 1; up += 1
+        elif p > 5:
+            dist["涨5-10%"] += 1; up += 1
+        elif p > 0.01:
+            dist["涨0-5%"] += 1; up += 1
+        elif p >= -0.01:
+            dist["平盘"] += 1; flat += 1
+        elif p >= -5:
+            dist["跌0-5%"] += 1; down += 1
+        elif p >= -9.8:
+            dist["跌5-10%"] += 1; down += 1
         else:
-            count = int(df[(df['涨跌幅'] > lower) & (df['涨跌幅'] <= upper)].shape[0])
-        distribution[name] = count
-
-    up_count = int(df[df['涨跌幅'] > 0].shape[0])
-    down_count = int(df[df['涨跌幅'] < 0].shape[0])
-
-    data = {
-        "status": "success",
-        "data": {
-            "distribution": distribution,
-            "summary": {
-                "up_count": up_count,
-                "down_count": down_count,
-                "flat_count": distribution.get('平盘', 0),
-                "total_count": len(df)
-            }
-        },
-        "last_updated": now_bj().strftime('%Y-%m-%d %H:%M:%S')
+            dist["跌停"] += 1; down += 1
+    return {
+        "distribution": dist,
+        "summary": {"up_count": up, "down_count": down, "flat_count": flat, "total_count": len(stocks)}
     }
-
-    return data
 
 
 def main():
     try:
-        patch_requests_headers()
-        data = fetch_market_distribution()
+        stocks = fetch_all_stocks()
+        if len(stocks) < 100:
+            raise RuntimeError(f"数据不足: {len(stocks)}")
+
+        result = calc_distribution(stocks)
+        output = {
+            "status": "success",
+            "data": result,
+            "last_updated": now_bj().strftime("%Y-%m-%d %H:%M:%S"),
+        }
 
         os.makedirs(OUTPUT_DIR, exist_ok=True)
+        with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+            json.dump(output, f, ensure_ascii=False, indent=2)
 
-        with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-
-        summary = data['data']['summary']
-        print(f"[{now_bj().strftime('%Y-%m-%d %H:%M:%S')}] 数据更新完成！")
-        print(f"  总计: {summary['total_count']} | 涨: {summary['up_count']} | 跌: {summary['down_count']} | 平: {summary['flat_count']}")
-        print(f"  输出: {OUTPUT_FILE}")
+        s = result["summary"]
+        log(f"完成！总计 {s['total_count']} | 涨 {s['up_count']} | 跌 {s['down_count']} | 平 {s['flat_count']}")
+        log(f"分布: {result['distribution']}")
+        log(f"输出: {OUTPUT_FILE}")
 
     except Exception as e:
-        print(f"[{now_bj().strftime('%Y-%m-%d %H:%M:%S')}] 抓取数据失败（已重试{MAX_RETRIES}次）: {e}", file=sys.stderr)
+        log(f"失败: {e}")
         sys.exit(1)
 
 

@@ -11,17 +11,19 @@
   - 由 GitHub Actions 定时调用
   - 交易日 9:30-15:00 每20分钟跑一次
   - 非交易时间由 Actions 的 cron 控制，脚本本身不做时间判断
-  - 内置重试机制，东方财富接口超时自动重试3次
+  - 内置重试机制（5次）+ 浏览器请求头伪装，绕过东财反爬
   - 时间戳使用北京时间（UTC+8）
 ===========================================
 """
 
 import akshare as ak
+import requests
 import pandas as pd
 import json
 import os
 import sys
 import time
+import random
 from datetime import datetime, timezone, timedelta
 
 # ============================================
@@ -29,13 +31,22 @@ from datetime import datetime, timezone, timedelta
 # ============================================
 OUTPUT_DIR = "dist"
 OUTPUT_FILE = os.path.join(OUTPUT_DIR, "data.json")
-MAX_RETRIES = 3
-RETRY_DELAY = 10  # 秒
+MAX_RETRIES = 5
+RETRY_DELAY = 15  # 秒
 
 # 北京时间
 BJ_TZ = timezone(timedelta(hours=8))
 
-# 涨跌幅区间定义（和你原来的逻辑一致）
+# 浏览器 User-Agent 池，随机选一个伪装请求
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:134.0) Gecko/20100101 Firefox/134.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+]
+
+# 涨跌幅区间定义
 RANGES = {
     '涨停': (9.8, float('inf')),
     '上涨5-10%': (5, 9.8),
@@ -52,10 +63,42 @@ def now_bj():
     return datetime.now(BJ_TZ)
 
 
+def patch_requests_headers():
+    """给 requests 全局 Session 打补丁，伪装浏览器请求头，绕过东财反爬"""
+    ua = random.choice(USER_AGENTS)
+    headers = {
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Referer": "https://quote.eastmoney.com/center/gridlist.html",
+    }
+    # 猴子补丁：替换 requests.Session 的默认 headers
+    original_init = requests.Session.__init__
+
+    def patched_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        self.headers.update(headers)
+
+    requests.Session.__init__ = patched_init
+
+    # 也给 requests.get/post 的默认 headers 打补丁
+    if hasattr(requests, 'utils'):
+        requests.utils.default_headers = lambda: requests.structures.CaseInsensitiveDict(headers)
+
+    print(f"[{now_bj().strftime('%Y-%m-%d %H:%M:%S')}] 已伪装浏览器请求头: {ua[:50]}...")
+
+
 def fetch_with_retry():
-    """带重试的数据抓取"""
+    """带重试的数据抓取，每次重试前重新伪装请求头"""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
+            if attempt > 1:
+                jitter = random.uniform(3, 8)
+                print(f"  随机等待{jitter:.1f}秒...")
+                time.sleep(jitter)
+            patch_requests_headers()
             print(f"[{now_bj().strftime('%Y-%m-%d %H:%M:%S')}] 第{attempt}次尝试获取数据...")
             df = ak.stock_zh_a_spot_em()
             print(f"[{now_bj().strftime('%Y-%m-%d %H:%M:%S')}] 数据获取成功，共{len(df)}条")
@@ -63,8 +106,9 @@ def fetch_with_retry():
         except Exception as e:
             print(f"[{now_bj().strftime('%Y-%m-%d %H:%M:%S')}] 第{attempt}次失败: {e}")
             if attempt < MAX_RETRIES:
-                print(f"  等待{RETRY_DELAY}秒后重试...")
-                time.sleep(RETRY_DELAY)
+                delay = RETRY_DELAY * attempt
+                print(f"  等待{delay}秒后重试...")
+                time.sleep(delay)
             else:
                 raise
 
@@ -77,7 +121,6 @@ def fetch_market_distribution():
     df['涨跌幅'] = pd.to_numeric(df['涨跌幅'], errors='coerce')
     df = df.dropna(subset=['涨跌幅'])
 
-    # 计算各区间数量
     distribution = {}
     for name, (lower, upper) in RANGES.items():
         if lower == upper:
@@ -108,12 +151,11 @@ def fetch_market_distribution():
 
 def main():
     try:
+        patch_requests_headers()
         data = fetch_market_distribution()
 
-        # 确保输出目录存在
         os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-        # 写入 JSON
         with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 

@@ -1,0 +1,21 @@
+{
+  "status": "success",
+  "data": {
+    "distribution": {
+      "涨停": 43,
+      "涨5-10%": 61,
+      "涨0-5%": 490,
+      "平盘": 381,
+      "跌0-5%": 4244,
+      "跌5-10%": 260,
+      "跌停": 27
+    },
+    "summary": {
+      "up_count": 594,
+      "down_count": 4531,
+      "flat_count": 381,
+      "total_count": 5506
+    }
+  },
+  "last_updated": "2026-09-11 17:58:54"
+}
